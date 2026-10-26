@@ -13,6 +13,7 @@
    (첫 실행 때 압축을 푸느라 몇 초 걸립니다.)
 2. 실행 후 파일을 **재생 순서대로** 추가합니다. (1부 → 2부)
 3. 잘라낼 파일을 선택하면 미리보기가 뜹니다. 슬라이더/±버튼(프레임 단위 포함)으로 장면을 찾아 **시작으로 / 끝으로** 지정하고 구간 추가.
+   `▶ 재생`(스페이스바)으로 0.5x~8x 배속 재생도 됩니다. 타임라인을 끌어 양쪽 끝 밖으로 가면 맨 처음/맨 끝에 붙습니다.
    시간을 직접 입력해도 됩니다. 미리보기는 화면만 보여주며 소리는 나오지 않습니다.
    시간 형식: `1:02:10.5`, `62:10`, `3730`. 끝을 비우면 영상 끝까지 잘라냅니다.
 4. 저장 경로 지정 → 시작.
@@ -42,4 +43,5 @@ SmartCutMerge.exe 출력.mp4 "1부.mp4@1:02:10-1:02:40,1:30:00-1:31:00" "2부.mp
 
 SmartCutMerge: MIT.
 exe에는 [FFmpeg](https://ffmpeg.org) (gyan.dev essentials build, GPL v3)가 포함되어 있으며 FFmpeg 자체 라이선스를 따릅니다 (`licenses/FFmpeg-GPL-3.0.txt`).
+미리보기에는 [PyAV](https://github.com/PyAV-Org/PyAV) (BSD-3-Clause, 자체 FFmpeg 라이브러리 LGPL 포함)를 사용합니다.
 FFmpeg 소스: https://ffmpeg.org/download.html · 빌드: https://www.gyan.dev/ffmpeg/builds/

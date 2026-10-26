@@ -1,7 +1,7 @@
 """Smart-cut + merge engine on top of ffmpeg.
 
 Only the few seconds around each cut point are re-encoded; everything else is
-stream-copied. Pieces are written as MPEG-TS and joined with the concat demuxer.
+stream-copied. Video pieces are streamed as MPEG-TS straight into the final muxer.
 """
 import bisect
 import json
@@ -114,6 +114,7 @@ def probe(path):
         "fps": fps,
         "pix_fmt": v.get("pix_fmt", "yuv420p"),
         "profile": v.get("profile", ""),
+        "level": v.get("level") or 0,
         "audio": [(a["codec_name"], int(a.get("sample_rate") or 0), a.get("channels", 0),
                    int(a.get("bit_rate") or 0), (a.get("tags", {}).get("title") or a.get("tags", {}).get("name") or ""))
                   for a in streams if a["codec_type"] == "audio"],
@@ -124,21 +125,24 @@ def keyframes(info):
     _, fp = tools()
     out = _capture([fp, "-v", "error", "-select_streams", "v:0",
                     "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", info["path"]])
-    times, idxs, n = [], [], 0
+    times, idxs, n, last = [], [], 0, 0.0
     for line in out.splitlines():
         t, _, f = line.partition(",")
-        if f.startswith("K") and t not in ("", "N/A"):
-            times.append(float(t) - info["start"])
-            idxs.append(n)
+        if t not in ("", "N/A"):
+            last = max(last, float(t))
+            if f.startswith("K"):
+                times.append(float(t) - info["start"])
+                idxs.append(n)
         n += 1
     order = sorted(range(len(times)), key=times.__getitem__)
-    return [times[i] for i in order], [idxs[i] for i in order], n
+    vend = last + 1 / float(Fraction(info["fps"])) - info["start"]
+    return [times[i] for i in order], [idxs[i] for i in order], n, vend
 
 
 def compatible(a, b):
     sig = lambda i: [x[:3] for x in i["audio"]]
     fa, fb = float(Fraction(a["fps"])), float(Fraction(b["fps"]))
-    return (all(a[k] == b[k] for k in ("vcodec", "w", "h", "pix_fmt"))
+    return (all(a[k] == b[k] for k in ("vcodec", "w", "h", "pix_fmt", "profile"))
             and abs(fa - fb) <= 0.01 * max(fa, fb) and sig(a) == sig(b))
 
 
@@ -163,7 +167,7 @@ def keep_ranges(dur, cuts):
 
 
 def plan_pieces(info, kfs, keep, normalize):
-    kfs, kidx, npk = kfs or ([], [], 0)
+    kfs, kidx, npk, vend = kfs or ([], [], 0, 0.0)
     ranges = []
     dur = info["duration"]
     for s, e in keep:
@@ -178,7 +182,7 @@ def plan_pieces(info, kfs, keep, normalize):
         ks = kfs[i] if i < len(kfs) else None
         if e >= dur - EPS:
             # file duration can include an audio tail; the last video frame defines the end
-            ke, n_end = (ks + (npk - kidx[i]) / float(Fraction(info["fps"])) if ks is not None else dur), npk
+            ke, n_end = (vend if ks is not None else dur), npk
         else:
             j = bisect.bisect_right(kfs, e + EPS) - 1
             ke, n_end = (kfs[j], kidx[j]) if j >= 0 else (None, None)
@@ -231,7 +235,7 @@ def _run(cmd, on_time, cancel, cwd=None):
         raise CutError("ffmpeg 오류:\n" + "\n".join(tail))
 
 
-def _stream(cmd, sink, on_time, cancel):
+def _stream(cmd, sink, on_time, cancel, sink_tail=None):
     """Run ffmpeg writing MPEG-TS to stdout and forward it into `sink` (another process's stdin)."""
     p = _spawn(cmd, stdout=subprocess.PIPE)
     tail = deque(maxlen=15)
@@ -246,7 +250,7 @@ def _stream(cmd, sink, on_time, cancel):
                 raise Cancelled()
             sink.write(chunk)
     except (BrokenPipeError, OSError):
-        raise CutError("합치기 프로세스가 중단되었습니다.")
+        raise CutError("합치기 프로세스가 중단되었습니다.\n" + "\n".join(sink_tail or []))
     finally:
         if p.poll() is None:
             p.kill()
@@ -265,6 +269,8 @@ def _venc(t, scale):
                 "constrained baseline": "baseline"}.get(t["profile"].lower())
         if prof and t["pix_fmt"] == "yuv420p":
             a += ["-profile:v", prof]
+    if t["vcodec"] == "h264" and t.get("level", 0) > 0:
+        a += ["-level:v", f"{t['level'] / 10:.1f}"]
     a += ["-pix_fmt", t["pix_fmt"], "-r", t["fps"]]
     if scale:
         w, h = t["w"], t["h"]
@@ -315,6 +321,8 @@ def merge(jobs, output, on_progress=None, on_log=None, cancel=None):
     if not jobs:
         raise CutError("입력 파일이 없습니다.")
     out_abs = os.path.abspath(output)
+    if not os.path.splitext(out_abs)[1]:
+        out_abs += ".mp4"
     if any(os.path.abspath(j["path"]) == out_abs for j in jobs):
         raise CutError("출력 파일이 입력 파일과 같습니다.")
 
@@ -343,6 +351,11 @@ def merge(jobs, output, on_progress=None, on_log=None, cancel=None):
     n_enc = sum(1 for _, r in groups for p in r if p[0] == "enc")
     sumdur = sum(p[2] - p[1] for _, r in groups for p in r)
     total = sumdur * 1.2
+    need = sum(os.path.getsize(i["path"]) * sum(p[2] - p[1] for p in r) / max(i["duration"], 1)
+               for i, r in groups)
+    free = shutil.disk_usage(os.path.dirname(out_abs) or ".").free
+    if free < need * 1.03 + (64 << 20):
+        raise CutError(f"저장 공간이 부족합니다. 필요 약 {need / 2**30:.1f} GB, 남은 공간 {free / 2**30:.1f} GB")
     log(f"조각 {n_all}개 (재인코딩 {n_enc}개, 나머지는 무손실 복사)")
 
     base = ["-hide_banner", "-loglevel", LOGLEVEL, "-nostdin", "-y", "-progress", "pipe:2", "-nostats"]
@@ -419,7 +432,7 @@ def merge(jobs, output, on_progress=None, on_log=None, cancel=None):
                     cmd = [ff, *base, "-ss", f"{s:.6f}", "-i", info["path"], "-t", f"{e - s:.6f}",
                            "-map", "0:v:0", "-an"]
                     cmd += _venc(target, normalize) + ["-bf", "0"] + _ts_out(want, "pipe:1")
-                _stream(cmd, final.stdin, progress, cancel)
+                _stream(cmd, final.stdin, progress, cancel, ftail)
                 done += e - s
                 work += e - s
                 prog(work / total)
@@ -449,13 +462,246 @@ def merge(jobs, output, on_progress=None, on_log=None, cancel=None):
                 pass
 
 
-def grab_frame(path, t, width=640, accurate=True):
-    """One frame at time t as PNG bytes (None on failure)."""
+def grab_frame(path, t, width=640, accurate=True, proc_holder=None):
+    """One frame at time t as PNG bytes (None on failure or when killed)."""
     ff, _ = tools()
     cmd = [ff, "-hide_banner", "-loglevel", "error", "-nostdin"]
     if not accurate:
-        cmd.append("-noaccurate_seek")
-    cmd += ["-ss", f"{max(t, 0):.3f}", "-i", path, "-frames:v", "1",
-            "-vf", f"scale={width}:-2", "-f", "image2pipe", "-vcodec", "png", "-"]
-    p = subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW)
-    return p.stdout or None
+        # scrubbing: land on the nearest earlier keyframe and decode only that
+        cmd += ["-noaccurate_seek", "-skip_frame", "nokey"]
+    cmd += ["-ss", f"{max(t, 0):.3f}", "-i", path, "-an", "-sn", "-frames:v", "1",
+            "-vf", f"scale={width}:-2:flags=fast_bilinear", "-f", "image2pipe", "-vcodec", "png", "-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         creationflags=NO_WINDOW)
+    if proc_holder is not None:
+        proc_holder[0] = p
+    out = p.stdout.read()
+    p.wait()
+    return out if p.returncode == 0 and out else None
+
+
+class FrameServer(threading.Thread):
+    """Preview frames: one ffmpeg at a time, only the newest request is served,
+    a superseded one is killed immediately, recent frames are cached."""
+
+    def __init__(self, on_frame, width=400):
+        super().__init__(daemon=True)
+        self.on_frame, self.width = on_frame, width
+        self._cv = threading.Condition()
+        self._req = None
+        self._proc = [None]
+        self._cache = {}
+        self._busy_exact = False
+        self._order = deque(maxlen=96)
+        self.start()
+
+    def request(self, path, t, accurate, tag):
+        with self._cv:
+            self._req = (path, t, accurate, tag)
+            p = self._proc[0]
+            # a slow exact decode is abandoned when the user moves on; a quick scrub frame
+            # is allowed to finish so something is always on screen while dragging
+            if (self._busy_exact or accurate) and p is not None and p.poll() is None:
+                p.kill()
+            self._cv.notify()
+
+    def run(self):
+        while True:
+            with self._cv:
+                while self._req is None:
+                    self._cv.wait()
+                req, self._req = self._req, None
+            path, t, accurate, tag = req
+            key = (path, round(t, 2 if accurate else 1), accurate)
+            data = self._cache.get(key)
+            if data is None:
+                self._busy_exact = accurate
+                try:
+                    data = grab_frame(path, t, self.width, accurate, self._proc)
+                except Exception:  # noqa: BLE001
+                    data = None
+                self._busy_exact = False
+                if data:
+                    if len(self._order) == self._order.maxlen:
+                        self._cache.pop(self._order[0], None)
+                    self._order.append(key)
+                    self._cache[key] = data
+            if data:
+                self.on_frame(tag, data)
+
+
+class AvFrameServer(threading.Thread):
+    """Same job as FrameServer, but decodes in-process with PyAV on an already-open file
+    (no ffmpeg launch / file open per frame). Scrubbing uses GPU decoding when available,
+    exact frames use the CPU, and play() decodes sequentially for real-time playback."""
+
+    def __init__(self, on_frame, width=400):
+        super().__init__(daemon=True)
+        import av  # noqa: F401  (ImportError -> caller falls back to FrameServer)
+        self.on_frame, self.width = on_frame, width
+        self._cv = threading.Condition()
+        self._req = None
+        self._gen = 0
+        self._cache = {}
+        self._order = deque(maxlen=96)
+        self._path = None
+        self._c = self._vs = self._ch = self._vsh = None
+        self._pstop = None
+        self.can_play = True
+        self.start()
+
+    def request(self, path, t, accurate, tag):
+        with self._cv:
+            self._gen += 1
+            self._req = (path, t, accurate, tag, self._gen)
+            self._cv.notify()
+
+    def _close(self):
+        for c in (self._c, self._ch):
+            try:
+                if c is not None:
+                    c.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._c = self._vs = self._ch = self._vsh = None
+        self._path = None
+
+    def _open(self, path):
+        import av
+        self._close()
+        self._c = av.open(path)
+        self._vs = next(s for s in self._c.streams if s.type == "video")
+        self._vs.thread_type = "AUTO"
+        self._path = path
+        try:  # GPU decoder: ~4x faster for single keyframes
+            from av.codec.hwaccel import HWAccel
+            self._ch = av.open(path, hwaccel=HWAccel(device_type="d3d11va"))
+            self._vsh = next(s for s in self._ch.streams if s.type == "video")
+            self._vsh.thread_type = "AUTO"
+        except Exception:  # noqa: BLE001
+            self._ch = self._vsh = None
+
+    def _ppm(self, frame):
+        w = self.width
+        h = max(2, int(round(w * frame.height / frame.width)) // 2 * 2)
+        f = frame.reformat(width=w, height=h, format="rgb24")
+        pl = f.planes[0]
+        raw = bytes(pl)
+        if pl.line_size != w * 3:
+            raw = b"".join(raw[r * pl.line_size:r * pl.line_size + w * 3] for r in range(h))
+        return b"P6\n%d %d\n255\n" % (w, h) + raw
+
+    def _decode(self, path, t, accurate, gen):
+        if path != self._path:
+            self._open(path)
+        c, vs = (self._ch, self._vsh) if (not accurate and self._ch is not None) else (self._c, self._vs)
+        cc = vs.codec_context
+        base = (c.start_time or 0) / 1e6
+        target = t + base
+        cc.skip_frame = "DEFAULT" if accurate else "NONKEY"
+        c.seek(int(target / vs.time_base), stream=vs, backward=True, any_frame=False)
+        cc.flush_buffers()
+        slack = 0.5 / float(vs.average_rate or 30)
+        frame = None
+        for fr in c.decode(vs):
+            frame = fr
+            if not accurate or (fr.time is not None and fr.time >= target - slack):
+                break
+            if self._gen != gen:  # a newer request arrived: abandon the exact decode
+                return None
+        return self._ppm(frame) if frame is not None else None
+
+    def run(self):
+        while True:
+            with self._cv:
+                while self._req is None:
+                    self._cv.wait()
+                req, self._req = self._req, None
+            path, t, accurate, tag, gen = req
+            key = (path, round(t, 2 if accurate else 1), accurate)
+            data = self._cache.get(key)
+            if data is None:
+                try:
+                    data = self._decode(path, t, accurate, gen)
+                except Exception:  # noqa: BLE001
+                    data = None
+                    if not accurate and self._ch is not None:
+                        self._ch = self._vsh = None  # GPU path failed: use the CPU from now on
+                    else:
+                        self._path = None
+                if data:
+                    if len(self._order) == self._order.maxlen:
+                        self._cache.pop(self._order[0], None)
+                    self._order.append(key)
+                    self._cache[key] = data
+            if data:
+                self.on_frame(tag, data)
+
+    # ---- real-time playback (video only) ----
+    def play(self, path, t0, speed, cb):
+        """cb(time, ppm) about 30x per second; cb(None, None) when the file ends."""
+        self.stop_play()
+        self._pstop = threading.Event()
+        threading.Thread(target=self._play_loop, args=(path, t0, speed, cb, self._pstop),
+                         daemon=True).start()
+
+    def stop_play(self):
+        if self._pstop is not None:
+            self._pstop.set()
+
+    def _play_loop(self, path, t0, speed, cb, stop):
+        import av
+        c = None
+        try:
+            c = av.open(path)
+            vs = next(s for s in c.streams if s.type == "video")
+            vs.thread_type = "AUTO"
+            base = (c.start_time or 0) / 1e6
+            c.seek(int((t0 + base) / vs.time_base), stream=vs, backward=True, any_frame=False)
+            vs.codec_context.flush_buffers()
+            slack = 0.5 / float(vs.average_rate or 30)
+            wall0 = ft0 = None
+            last_sent = 0.0
+            for fr in c.decode(vs):
+                if stop.is_set():
+                    return
+                if fr.time is None:
+                    continue
+                ft = fr.time - base
+                if ft < t0 - slack:
+                    continue
+                if wall0 is None:
+                    wall0, ft0 = time.time(), ft
+                due = wall0 + (ft - ft0) / speed
+                while True:
+                    now = time.time()
+                    if stop.is_set():
+                        return
+                    if now >= due:
+                        break
+                    time.sleep(min(due - now, 0.02))
+                if now - due > 0.08 or now - last_sent < 0.028:
+                    continue  # running late / already showing 30 fps: drop this frame
+                cb(ft, self._ppm(fr))
+                last_sent = time.time()
+            if not stop.is_set():
+                cb(None, None)
+        except Exception:  # noqa: BLE001
+            if not stop.is_set():
+                cb(None, None)
+        finally:
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def make_frame_server(on_frame, width=400):
+    want = os.environ.get("SMARTCUT_PREVIEW", "")
+    if want != "ffmpeg":
+        try:
+            return AvFrameServer(on_frame, width)
+        except ImportError:
+            pass
+    return FrameServer(on_frame, width)

@@ -2,6 +2,7 @@ import base64
 import os
 import queue
 import threading
+import time
 from fractions import Fraction
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -21,10 +22,13 @@ class App(ttk.Frame):
         self.worker = None
         self.pos = 0.0
         self.seq = 0
+        self._shown = 0
         self._after = None
+        self._last_req = 0.0
         self.photo = None
+        self.frames = engine.make_frame_server(lambda tag, data: self.q.put(("img", (tag, data))))
         self._build()
-        self.after(100, self._poll)
+        self.after(12, self._poll)
 
     # ---------- layout ----------
     def _build(self):
@@ -72,13 +76,29 @@ class App(ttk.Frame):
                         ("1프레임 ▶", "+f"), ("+1초", 1), ("+5초", 5), ("+30초", 30)):
             ttk.Button(nav, text=text, width=9,
                        command=lambda d=d: self._step(d)).pack(side="left", padx=1)
+        self.playing = False
+        if getattr(self.frames, "can_play", False):
+            self.btn_play = ttk.Button(nav, text="▶ 재생", width=8, command=self.toggle_play)
+            self.btn_play.pack(side="left", padx=(8, 1))
+            self.v_speed = tk.StringVar(value="1x")
+            ttk.Combobox(nav, textvariable=self.v_speed, values=["0.5x", "1x", "2x", "4x", "8x"],
+                         width=4, state="readonly").pack(side="left")
         self.v_pos = tk.StringVar(value="0:00:00.000")
         ttk.Label(nav, textvariable=self.v_pos, width=12, anchor="e").pack(side="right")
         mk = ttk.Frame(pv)
-        mk.pack(fill="x", pady=(4, 0))
-        ttk.Button(mk, text="현재 위치를 시작으로", command=lambda: self.v_start.set(engine.fmt_time(self.pos))).pack(side="left")
-        ttk.Button(mk, text="현재 위치를 끝으로", command=lambda: self.v_end.set(engine.fmt_time(self.pos))).pack(side="left", padx=4)
-        ttk.Label(mk, text="(빨간 영역 = 잘라낼 구간)").pack(side="left", padx=8)
+        mk.pack(fill="x", pady=(8, 2))
+        inner = ttk.Frame(mk)
+        inner.pack(anchor="center")
+        big = ("맑은 고딕", 12, "bold")
+        tk.Button(inner, text="◀ 현재 위치를 시작으로", font=big, bg="#2e9e5b", fg="white",
+                  activebackground="#24804a", activeforeground="white", relief="flat",
+                  padx=16, pady=8, cursor="hand2",
+                  command=lambda: self.v_start.set(engine.fmt_time(self.pos))).pack(side="left", padx=6)
+        tk.Button(inner, text="현재 위치를 끝으로 ▶", font=big, bg="#d64545", fg="white",
+                  activebackground="#b33636", activeforeground="white", relief="flat",
+                  padx=16, pady=8, cursor="hand2",
+                  command=lambda: self.v_end.set(engine.fmt_time(self.pos))).pack(side="left", padx=6)
+        ttk.Label(mk, text="빨간 영역 = 잘라낼 구간", anchor="center").pack(fill="x", pady=(4, 0))
 
         mid = ttk.LabelFrame(self, text="2. 잘라낼 구간 (선택한 파일 기준, 영상 플레이어에 보이는 시간)", padding=6)
         mid.pack(fill="both", expand=True, pady=8)
@@ -125,6 +145,10 @@ class App(ttk.Frame):
         if select is not None and self.files:
             self.file_list.selection_set(select)
         self._refresh_cuts()
+        if not self.files:
+            self.photo = None
+            self.img.configure(image="")
+            self.v_pos.set("0:00:00.000")
         self._request(True)
 
     def _sel(self):
@@ -145,17 +169,56 @@ class App(ttk.Frame):
             self._refresh_files(min(i, len(self.files) - 1) if self.files else None)
 
     def pick_output(self):
-        p = filedialog.asksaveasfilename(defaultextension=".mp4",
+        cur = self.v_out.get().strip()
+        if cur:
+            folder, name = os.path.split(cur)
+        elif self.files:
+            first = self.files[0]["path"]
+            folder = os.path.dirname(first)
+            name = os.path.splitext(os.path.basename(first))[0] + "_합본.mp4"
+        else:
+            folder, name = "", "합본.mp4"
+        p = filedialog.asksaveasfilename(defaultextension=".mp4", initialdir=folder or None,
+                                         initialfile=name,
                                          filetypes=[("MP4", "*.mp4"), ("MKV", "*.mkv")])
         if p:
-            self.v_out.set(p)
+            self.v_out.set(os.path.normpath(p))
 
     # ---------- preview ----------
     def _cur(self):
         i = self._sel()
         return self.files[i] if i is not None else None
 
+    def toggle_play(self):
+        if self.playing:
+            self._stop_play()
+            return
+        f = self._cur()
+        if not f:
+            return
+        self.playing = True
+        self.btn_play.configure(text="⏸ 정지")
+        speed = float(self.v_speed.get().rstrip("x"))
+        if self.pos >= f["info"]["duration"] - 0.5:
+            self.pos = 0.0
+        self.frames.play(f["path"], self.pos, speed,
+                         lambda t, data: self.q.put(("play", (t, data))))
+
+    def _stop_play(self):
+        if self.playing:
+            self.playing = False
+            self.frames.stop_play()
+            self.btn_play.configure(text="▶ 재생")
+
+    def on_space(self, event):
+        if isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Combobox)):
+            return
+        if getattr(self.frames, "can_play", False):
+            self.toggle_play()
+            return "break"
+
     def _on_file_select(self):
+        self._stop_play()
         self.pos = 0.0
         self._refresh_cuts()
         self._request(True)
@@ -177,7 +240,15 @@ class App(ttk.Frame):
         f = self._cur()
         if f:
             w = max(self.tl.winfo_width(), 1)
-            self._seek(min(max(x / w, 0), 1) * f["info"]["duration"], final)
+            dur = f["info"]["duration"]
+            # dragging to / past an edge sticks to the very start or the very end
+            if x <= 6:
+                t = 0.0
+            elif x >= w - 6:
+                t = dur
+            else:
+                t = x / w * dur
+            self._seek(t, final)
 
     def _step(self, d):
         f = self._cur()
@@ -192,31 +263,41 @@ class App(ttk.Frame):
         f = self._cur()
         if not f:
             return
-        self.pos = min(max(t, 0.0), max(f["info"]["duration"] - 0.05, 0.0))
+        self._stop_play()
+        self.pos = min(max(t, 0.0), f["info"]["duration"])
         self.v_pos.set(engine.fmt_time(self.pos))
         self._draw_tl()
-        if self._after:
-            self.after_cancel(self._after)
-            self._after = None
         if final:
+            if self._after:
+                self.after_cancel(self._after)
+                self._after = None
             self._request(True)
-        else:
-            self._after = self.after(80, lambda: self._request(False))
+            return
+        # throttle (not debounce): paint a frame right away, then at most ~33 requests/s while
+        # the mouse keeps moving; the last position is always requested
+        gap = 0.03 - (time.time() - self._last_req)
+        if gap <= 0:
+            if self._after:
+                self.after_cancel(self._after)
+                self._after = None
+            self._request(False)
+        elif not self._after:
+            self._after = self.after(int(gap * 1000) + 1, self._trailing)
+
+    def _trailing(self):
+        self._after = None
+        self._request(False)
 
     def _request(self, accurate):
         f = self._cur()
         if not f:
             return
         self.seq += 1
-        seq, path, t = self.seq, f["path"], self.pos
-        self.v_pos.set(engine.fmt_time(t))
-
-        def job():
-            try:
-                self.q.put(("img", (seq, engine.grab_frame(path, t, 400, accurate))))
-            except Exception:  # noqa: BLE001
-                pass
-        threading.Thread(target=job, daemon=True).start()
+        self._last_req = time.time()
+        self.v_pos.set(engine.fmt_time(self.pos))
+        # the last decodable frame is a hair before the nominal end
+        self.frames.request(f["path"], min(self.pos, max(f["info"]["duration"] - 0.05, 0.0)),
+                            accurate, self.seq)
 
     # ---------- cuts ----------
     def _jump_cut(self):
@@ -280,6 +361,7 @@ class App(ttk.Frame):
         if os.path.exists(out) and not messagebox.askyesno("확인", "이미 있는 파일입니다. 덮어쓸까요?"):
             return
         jobs = [{"path": f["path"], "cuts": list(f["cuts"])} for f in self.files]
+        self._stop_play()
         self.cancel.clear()
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
@@ -307,9 +389,31 @@ class App(ttk.Frame):
                     self.v_pct.set(f"{val * 100:.0f}%")
                 elif kind == "img":
                     seq, data = val
-                    if seq == self.seq and data:
-                        self.photo = tk.PhotoImage(data=base64.b64encode(data))
+                    if data and seq >= self._shown:
+                        self._shown = seq
+                        try:
+                            if data[:2] == b"P6":
+                                self.photo = tk.PhotoImage(data=data, format="ppm")
+                            else:
+                                self.photo = tk.PhotoImage(data=base64.b64encode(data))
+                            self.img.configure(image=self.photo)
+                        except tk.TclError:
+                            pass
+                elif kind == "play":
+                    t, data = val
+                    if not self.playing:
+                        continue
+                    if t is None:
+                        self._stop_play()
+                        continue
+                    self.pos = t
+                    self.v_pos.set(engine.fmt_time(t))
+                    self._draw_tl()
+                    try:
+                        self.photo = tk.PhotoImage(data=data, format="ppm")
                         self.img.configure(image=self.photo)
+                    except tk.TclError:
+                        pass
                 elif kind == "l":
                     self._log(val)
                 elif kind == "err":
@@ -322,9 +426,11 @@ class App(ttk.Frame):
                         os.startfile(os.path.dirname(os.path.abspath(val)))
         except queue.Empty:
             pass
-        self.after(100, self._poll)
+        self.after(12, self._poll)
 
     def close(self):
+        if hasattr(self.frames, "stop_play"):
+            self.frames.stop_play()
         self.cancel.set()
         if self.worker and self.worker.is_alive():
             self.worker.join(5)
@@ -345,6 +451,7 @@ def run():
         messagebox.showerror("ffmpeg 필요", str(e))
         return
     app = App(root)
+    root.title(root.title() + ("  [미리보기: PyAV]" if type(app.frames).__name__ == "AvFrameServer" else "  [미리보기: ffmpeg]"))
     root.update_idletasks()
     w = max(root.winfo_reqwidth() + 20, 720)
     h = min(root.winfo_reqheight() + 30, root.winfo_screenheight() - 90)
@@ -352,4 +459,5 @@ def run():
     y = max((root.winfo_screenheight() - h) // 2 - 20, 0)
     root.geometry(f"{w}x{h}+{x}+{y}")
     root.protocol("WM_DELETE_WINDOW", app.close)
+    root.bind("<space>", app.on_space)
     root.mainloop()
